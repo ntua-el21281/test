@@ -1,0 +1,374 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : ESP connect/url/payload/transmit (FAKE PACKET) - NO LL_GetTick
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+
+#include "main.h"
+#include <string.h>
+#include <stdio.h>
+#include <stdbool.h>
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_UART4_Init(void);
+static void MX_UART5_Init(void);
+
+/* ========================= USER CODE BEGIN 0 ========================= */
+
+#define ESP_URL   "http://192.168.1.250:5000/data"
+#define TEAM_NUM  5
+
+// --- UART helpers ---
+static void uart_send_str(USART_TypeDef *U, const char *s)
+{
+    while (*s) {
+        while (!LL_USART_IsActiveFlag_TXE(U)) {}
+        LL_USART_TransmitData8(U, (uint8_t)*s++);
+    }
+}
+
+static void uart_send_line(USART_TypeDef *U, const char *s)
+{
+    uart_send_str(U, s);
+    uart_send_str(U, "\r\n");
+}
+
+static void uart_flush_rx(USART_TypeDef *U)
+{
+    while (LL_USART_IsActiveFlag_RXNE(U)) {
+        (void)LL_USART_ReceiveData8(U);
+    }
+    if (LL_USART_IsActiveFlag_ORE(U)) LL_USART_ClearFlag_ORE(U);
+    if (LL_USART_IsActiveFlag_FE(U))  LL_USART_ClearFlag_FE(U);
+    if (LL_USART_IsActiveFlag_NE(U))  LL_USART_ClearFlag_NE(U);
+}
+
+// --- RX line read with timeout using a counter (NO LL_GetTick) ---
+static uint16_t uart_readline_timeout_counter(USART_TypeDef *U, char *buf, uint16_t maxlen, uint32_t timeout_counter)
+{
+    uint16_t i = 0;
+    memset(buf, 0, maxlen);
+
+    while (timeout_counter--) {
+        if (LL_USART_IsActiveFlag_RXNE(U)) {
+            char c = (char)LL_USART_ReceiveData8(U);
+
+            if (c == '\0') continue;
+
+            if (c == '\n' || c == '\r') {
+                if (i > 0) { buf[i] = '\0'; return i; }
+                continue; // ignore empty lines
+            }
+
+            if (i < (maxlen - 1)) buf[i++] = c;
+
+            // refresh timeout when bytes arrive (gives time for the rest of the line)
+            timeout_counter = 250000;
+        }
+    }
+
+    buf[i] = '\0';
+    return 0; // timeout
+}
+
+// Sends cmd to ESP and waits for ok_token or fail_token.
+// Uses repeated readline with counter timeouts (NO LL_GetTick).
+static bool esp_cmd_wait_counter(const char *cmd,
+                                 const char *ok_token,
+                                 const char *fail_token,
+                                 uint32_t overall_tries,
+                                 char *last_line,
+                                 uint16_t last_line_sz)
+{
+    char line[128];
+
+    if (last_line && last_line_sz) last_line[0] = '\0';
+
+    uart_flush_rx(UART5);
+    uart_send_str(UART5, cmd);
+
+    // overall_tries: how many "line attempts" we do
+    // each attempt has its own timeout_counter in uart_readline_timeout_counter
+    for (uint32_t k = 0; k < overall_tries; k++) {
+
+        uint16_t n = uart_readline_timeout_counter(UART5, line, sizeof(line), 600000);
+        if (n == 0) continue;
+
+        if (last_line && last_line_sz) {
+            strncpy(last_line, line, last_line_sz - 1);
+            last_line[last_line_sz - 1] = '\0';
+        }
+
+        if (ok_token && strstr(line, ok_token)) return true;
+        if (fail_token && strstr(line, fail_token)) return false;
+    }
+
+    return false;
+}
+
+static void esp_connect_blocking(void)
+{
+    char last[120];
+
+    while (1) {
+        uart_send_line(UART4, "PC: -> ESP:connect");
+
+        // overall_tries ~ number of lines we will accept before giving up this attempt
+        bool ok = esp_cmd_wait_counter("ESP:connect\n", "Success", "Fail", 40, last, sizeof(last));
+
+        uart_send_str(UART4, "PC: ESP last: [");
+        uart_send_str(UART4, last);
+        uart_send_line(UART4, "]");
+
+        if (ok) {
+            uart_send_line(UART4, "PC: CONNECT OK");
+            break;
+        } else {
+            uart_send_line(UART4, "PC: CONNECT FAIL/TIMEOUT -> retry");
+            LL_mDelay(1500);
+        }
+    }
+}
+
+static void esp_set_url_blocking(void)
+{
+    char cmd[220];
+    char last[120];
+
+    snprintf(cmd, sizeof(cmd), "ESP:url:\"%s\"\n", ESP_URL);
+
+    while (1) {
+        uart_send_line(UART4, "PC: -> ESP:url");
+
+        bool ok = esp_cmd_wait_counter(cmd, "Success", "Fail", 40, last, sizeof(last));
+
+        uart_send_str(UART4, "PC: ESP last: [");
+        uart_send_str(UART4, last);
+        uart_send_line(UART4, "]");
+
+        if (ok) {
+            uart_send_line(UART4, "PC: URL OK");
+            break;
+        } else {
+            uart_send_line(UART4, "PC: URL FAIL/TIMEOUT -> retry");
+            LL_mDelay(1500);
+        }
+    }
+}
+
+static bool esp_send_fake_packet_once(void)
+{
+    const char *temp   = "36.6";
+    const char *press  = "8.5";
+    const char *status = "OK";
+
+    char payload_cmd[320];
+    char last[140];
+
+    snprintf(payload_cmd, sizeof(payload_cmd),
+             "ESP:payload:["
+             "{\"name\":\"temperature\",\"value\":\"%s\"},"
+             "{\"name\":\"pressure\",\"value\":\"%s\"},"
+             "{\"name\":\"team\",\"value\":\"%d\"},"
+             "{\"name\":\"status\",\"value\":\"%s\"}"
+             "]\n",
+             temp, press, TEAM_NUM, status);
+
+    uart_send_line(UART4, "PC: -> ESP:payload");
+    uart_send_line(UART4, payload_cmd);
+
+    bool ok_payload = esp_cmd_wait_counter(payload_cmd, "Success", "Fail", 40, last, sizeof(last));
+    uart_send_str(UART4, "PC: payload last: [");
+    uart_send_str(UART4, last);
+    uart_send_line(UART4, "]");
+
+    uart_send_line(UART4, "PC: -> ESP:transmit");
+
+    // Some ESP firmwares answer "200 ..." others "Success"
+    bool ok_200 = esp_cmd_wait_counter("ESP:transmit\n", "200", "Fail", 60, last, sizeof(last));
+    bool ok_succ = false;
+    if (!ok_200 && strstr(last, "Success")) ok_succ = true;
+
+    uart_send_str(UART4, "PC: transmit last: [");
+    uart_send_str(UART4, last);
+    uart_send_line(UART4, "]");
+
+    return ok_payload && (ok_200 || ok_succ);
+}
+
+/* ========================= USER CODE END 0 ========================= */
+
+int main(void)
+{
+  /* MCU Configuration--------------------------------------------------------*/
+  LL_APB2_GRP1_EnableClock(LL_APB2_GRP1_PERIPH_SYSCFG);
+  LL_APB1_GRP1_EnableClock(LL_APB1_GRP1_PERIPH_PWR);
+
+  NVIC_SetPriorityGrouping(NVIC_PRIORITYGROUP_4);
+  NVIC_SetPriority(SysTick_IRQn, NVIC_EncodePriority(NVIC_GetPriorityGrouping(), 15, 0));
+
+  LL_PWR_DisableUCPDDeadBattery();
+
+  SystemClock_Config();
+
+  MX_GPIO_Init();
+  MX_UART4_Init();
+  MX_UART5_Init();
+
+  LL_USART_Enable(UART4);
+  LL_USART_Enable(UART5);
+  LL_mDelay(200);
+
+  uart_send_line(UART4, "");
+  uart_send_line(UART4, "=== STM32G474 ESP TEST (NO LL_GetTick) ===");
+
+  // 1) CONNECT
+  esp_connect_blocking();
+
+  // 2) URL
+  esp_set_url_blocking();
+
+  uart_send_line(UART4, "PC: Sending fake packet every 5 seconds...");
+
+  while (1)
+  {
+      bool ok = esp_send_fake_packet_once();
+      if (ok) uart_send_line(UART4, "PC: SEND OK");
+      else    uart_send_line(UART4, "PC: SEND FAIL (retry continues)");
+
+      LL_mDelay(5000);
+  }
+}
+
+/* ========================= GENERATED-LIKE INIT CODE ========================= */
+/* The following init code matches what you posted (STM32G474, UART4/UART5).   */
+
+void SystemClock_Config(void)
+{
+  LL_FLASH_SetLatency(LL_FLASH_LATENCY_4);
+  while(LL_FLASH_GetLatency() != LL_FLASH_LATENCY_4) {}
+
+  LL_PWR_EnableRange1BoostMode();
+
+  LL_RCC_HSI_Enable();
+  while(LL_RCC_HSI_IsReady() != 1) {}
+
+  LL_RCC_HSI_SetCalibTrimming(64);
+
+  LL_RCC_PLL_ConfigDomain_SYS(LL_RCC_PLLSOURCE_HSI, LL_RCC_PLLM_DIV_4, 85, LL_RCC_PLLR_DIV_2);
+
+  LL_RCC_PLL_EnableDomain_SYS();
+  LL_RCC_PLL_Enable();
+  while(LL_RCC_PLL_IsReady() != 1) {}
+
+  LL_RCC_SetSysClkSource(LL_RCC_SYS_CLKSOURCE_PLL);
+  while(LL_RCC_GetSysClkSource() != LL_RCC_SYS_CLKSOURCE_STATUS_PLL) {}
+
+  LL_RCC_SetAHBPrescaler(LL_RCC_SYSCLK_DIV_1);
+  LL_RCC_SetAPB1Prescaler(LL_RCC_APB1_DIV_1);
+  LL_RCC_SetAPB2Prescaler(LL_RCC_APB2_DIV_1);
+
+  LL_Init1msTick(170000000);
+  LL_SetSystemCoreClock(170000000);
+}
+
+static void MX_UART4_Init(void)
+{
+  LL_USART_InitTypeDef USART_InitStruct = {0};
+  LL_GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+  LL_RCC_SetUARTClockSource(LL_RCC_UART4_CLKSOURCE_PCLK1);
+  LL_APB1_GRP1_EnableClock(LL_APB1_GRP1_PERIPH_UART4);
+  LL_AHB2_GRP1_EnableClock(LL_AHB2_GRP1_PERIPH_GPIOC);
+
+  GPIO_InitStruct.Pin = LL_GPIO_PIN_10;
+  GPIO_InitStruct.Mode = LL_GPIO_MODE_ALTERNATE;
+  GPIO_InitStruct.Speed = LL_GPIO_SPEED_FREQ_LOW;
+  GPIO_InitStruct.OutputType = LL_GPIO_OUTPUT_PUSHPULL;
+  GPIO_InitStruct.Pull = LL_GPIO_PULL_NO;
+  GPIO_InitStruct.Alternate = LL_GPIO_AF_5;
+  LL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+  GPIO_InitStruct.Pin = LL_GPIO_PIN_11;
+  GPIO_InitStruct.Mode = LL_GPIO_MODE_ALTERNATE;
+  GPIO_InitStruct.Speed = LL_GPIO_SPEED_FREQ_LOW;
+  GPIO_InitStruct.OutputType = LL_GPIO_OUTPUT_PUSHPULL;
+  GPIO_InitStruct.Pull = LL_GPIO_PULL_NO;
+  GPIO_InitStruct.Alternate = LL_GPIO_AF_5;
+  LL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+  USART_InitStruct.PrescalerValue = LL_USART_PRESCALER_DIV1;
+  USART_InitStruct.BaudRate = 9600;
+  USART_InitStruct.DataWidth = LL_USART_DATAWIDTH_8B;
+  USART_InitStruct.StopBits = LL_USART_STOPBITS_1;
+  USART_InitStruct.Parity = LL_USART_PARITY_NONE;
+  USART_InitStruct.TransferDirection = LL_USART_DIRECTION_TX_RX;
+  USART_InitStruct.HardwareFlowControl = LL_USART_HWCONTROL_NONE;
+  USART_InitStruct.OverSampling = LL_USART_OVERSAMPLING_16;
+
+  LL_USART_Init(UART4, &USART_InitStruct);
+  LL_USART_DisableFIFO(UART4);
+  LL_USART_ConfigAsyncMode(UART4);
+  LL_USART_Enable(UART4);
+
+  while((!(LL_USART_IsActiveFlag_TEACK(UART4))) || (!(LL_USART_IsActiveFlag_REACK(UART4)))) {}
+}
+
+static void MX_UART5_Init(void)
+{
+  LL_USART_InitTypeDef USART_InitStruct = {0};
+  LL_GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+  LL_RCC_SetUARTClockSource(LL_RCC_UART5_CLKSOURCE_PCLK1);
+  LL_APB1_GRP1_EnableClock(LL_APB1_GRP1_PERIPH_UART5);
+  LL_AHB2_GRP1_EnableClock(LL_AHB2_GRP1_PERIPH_GPIOC);
+  LL_AHB2_GRP1_EnableClock(LL_AHB2_GRP1_PERIPH_GPIOD);
+
+  GPIO_InitStruct.Pin = LL_GPIO_PIN_12;
+  GPIO_InitStruct.Mode = LL_GPIO_MODE_ALTERNATE;
+  GPIO_InitStruct.Speed = LL_GPIO_SPEED_FREQ_LOW;
+  GPIO_InitStruct.OutputType = LL_GPIO_OUTPUT_PUSHPULL;
+  GPIO_InitStruct.Pull = LL_GPIO_PULL_NO;
+  GPIO_InitStruct.Alternate = LL_GPIO_AF_5;
+  LL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+  GPIO_InitStruct.Pin = LL_GPIO_PIN_2;
+  GPIO_InitStruct.Mode = LL_GPIO_MODE_ALTERNATE;
+  GPIO_InitStruct.Speed = LL_GPIO_SPEED_FREQ_LOW;
+  GPIO_InitStruct.OutputType = LL_GPIO_OUTPUT_PUSHPULL;
+  GPIO_InitStruct.Pull = LL_GPIO_PULL_NO;
+  GPIO_InitStruct.Alternate = LL_GPIO_AF_5;
+  LL_GPIO_Init(GPIOD, &GPIO_InitStruct);
+
+  USART_InitStruct.PrescalerValue = LL_USART_PRESCALER_DIV1;
+  USART_InitStruct.BaudRate = 9600;
+  USART_InitStruct.DataWidth = LL_USART_DATAWIDTH_8B;
+  USART_InitStruct.StopBits = LL_USART_STOPBITS_1;
+  USART_InitStruct.Parity = LL_USART_PARITY_NONE;
+  USART_InitStruct.TransferDirection = LL_USART_DIRECTION_TX_RX;
+  USART_InitStruct.HardwareFlowControl = LL_USART_HWCONTROL_NONE;
+  USART_InitStruct.OverSampling = LL_USART_OVERSAMPLING_16;
+
+  LL_USART_Init(UART5, &USART_InitStruct);
+  LL_USART_DisableFIFO(UART5);
+  LL_USART_ConfigAsyncMode(UART5);
+  LL_USART_Enable(UART5);
+
+  while((!(LL_USART_IsActiveFlag_TEACK(UART5))) || (!(LL_USART_IsActiveFlag_REACK(UART5)))) {}
+}
+
+static void MX_GPIO_Init(void)
+{
+  // Nothing needed for this ESP-only test.
+}
+
+void Error_Handler(void)
+{
+  __disable_irq();
+  while (1) {}
+}
